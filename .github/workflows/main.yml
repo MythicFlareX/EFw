@@ -1,0 +1,123 @@
+name: Build and Verify ApexCombat AI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Auto-locate project root or extract ZIP if uploaded unextracted
+        run: |
+          set -euo pipefail
+          if [ ! -d "src/main/java" ]; then
+            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1 || true)
+            if [ -n "$ZIP_FILE" ]; then
+              echo "Found unextracted archive $ZIP_FILE, extracting..."
+              unzip -oq "$ZIP_FILE" -d .
+            fi
+          fi
+          BUILD_DIR=$(find . -maxdepth 3 -name "build.gradle" -printf "%h\n" | head -n 1 || true)
+          if [ -z "$BUILD_DIR" ]; then
+            echo "ERROR: build.gradle not found anywhere in repository!" >&2
+            ls -la
+            exit 1
+          fi
+          echo "PROJECT_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
+          echo "Detected project directory: $BUILD_DIR"
+          ls -la "$BUILD_DIR"
+          find "$BUILD_DIR/src" -maxdepth 6 || true
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Clean build and run tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -x "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew clean build --no-daemon --stacktrace
+          else
+            gradle clean build --no-daemon --stacktrace
+          fi
+
+      - name: Inspect build/libs and verify generated JAR
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p READY-MOD
+
+          echo "=== All files in build/libs ==="
+          ls -la build/libs || true
+
+          JAR_PATH=$(find build/libs -maxdepth 1 -name "*.jar" \
+            ! -name "*-sources.jar" \
+            ! -name "*-javadoc.jar" \
+            ! -name "*-dev.jar" \
+            ! -name "*-slim.jar" \
+            | sort | tail -n 1 || true)
+
+          if [ -z "$JAR_PATH" ] || [ ! -f "$JAR_PATH" ]; then
+            echo "ERROR: No valid mod JAR produced in build/libs" >&2
+            exit 1
+          fi
+
+          echo "Selected JAR: $JAR_PATH"
+          SIZE_BYTES=$(stat -c%s "$JAR_PATH")
+          echo "JAR size: $SIZE_BYTES bytes"
+
+          if [ "$SIZE_BYTES" -lt 10240 ]; then
+            echo "ERROR: JAR size ($SIZE_BYTES bytes) is suspiciously small" >&2
+            unzip -l "$JAR_PATH" || true
+            exit 1
+          fi
+
+          unzip -t "$JAR_PATH" >/dev/null
+          ENTRIES=$(unzip -Z1 "$JAR_PATH")
+
+          echo "$ENTRIES" | grep -q "^fabric.mod.json$" || {
+            echo "ERROR: fabric.mod.json missing in JAR" >&2
+            exit 1
+          }
+
+          echo "$ENTRIES" | grep -q "^com/apexcombat/ai/ApexCombatAI\.class$" || {
+            echo "ERROR: Main class com/apexcombat/ai/ApexCombatAI.class missing in JAR" >&2
+            exit 1
+          }
+
+          echo "$ENTRIES" | grep -q "\.class$" || {
+            echo "ERROR: No compiled .class files found in JAR" >&2
+            exit 1
+          }
+
+          META_JSON=$(unzip -p "$JAR_PATH" fabric.mod.json)
+          echo "$META_JSON" | grep -q '"id"[[:space:]]*:[[:space:]]*"apexcombat-ai"' || {
+            echo "ERROR: Invalid or mismatched mod id in fabric.mod.json" >&2
+            exit 1
+          }
+
+          cp "$JAR_PATH" "READY-MOD/ApexCombat-AI-1.21.11.jar"
+          ls -lh "READY-MOD/ApexCombat-AI-1.21.11.jar"
+
+      - name: Upload verified mod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApexCombat-AI-Verified-Mod
+          path: ${{ env.PROJECT_DIR }}/READY-MOD/ApexCombat-AI-1.21.11.jar
+          if-no-files-found: error
